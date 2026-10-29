@@ -40,7 +40,7 @@
     <section class="hero" id="hero">
       <span class="hero__badge">exocad DentalCAD · OpenCTM çözücü</span>
       <h1 class="hero__title">Webview'daki modeli <span class="grad-text">STL'e çevir.</span></h1>
-      <p class="hero__sub">exocad'in ürettiği <strong>.html</strong> dosyasını yükle — içine gömülü 3D mesh'leri (çene, diş, restorasyon) çöz, <strong>3D</strong> incele ve <strong>STL</strong> olarak indir. Hepsi tarayıcında, dosyan sunucuya gitmez.</p>
+      <p class="hero__sub">exocad'in ürettiği <strong>.html</strong> dosyasını yükle — içine gömülü 3D mesh'leri (çene, diş, restorasyon) çöz, exocad'ın kendi görüntüleyicisiyle <strong>incele</strong> ve <strong>STL</strong> olarak indir. Hepsi tarayıcında, dosyan sunucuya gitmez.</p>
 
       <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="HTML dosyası yükle">
         <input type="file" id="fileInput" accept=".html,.htm,text/html" hidden />
@@ -55,7 +55,7 @@
 
       <div class="hero__features">
         <div class="feat"><span class="feat__ico">🧩</span> Mesh ayrıştırma</div>
-        <div class="feat"><span class="feat__ico">🧊</span> 3D önizleme</div>
+        <div class="feat"><span class="feat__ico">🏷️</span> Gerçek isimler</div>
         <div class="feat"><span class="feat__ico">📐</span> Binary STL</div>
         <div class="feat"><span class="feat__ico">📦</span> Toplu ZIP indir</div>
       </div>
@@ -63,7 +63,7 @@
 
     <!-- WORKSPACE -->
     <section class="workspace" id="workspace" hidden>
-      <!-- 3D viewer -->
+      <!-- exocad's own viewer -->
       <div class="viewer">
         <div class="viewer__head">
           <div class="viewer__meta">
@@ -71,26 +71,27 @@
             <span class="file-size" id="fileSize">—</span>
           </div>
           <div class="viewer__actions">
+            <button class="btn btn--ghost" id="btnOpenTab" title="Yeni sekmede aç">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7M10 14 21 3M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>
+            </button>
             <button class="btn btn--ghost" id="btnFullscreen" title="Tam ekran">
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3m8 0h3a2 2 0 0 0 2-2v-3"/></svg>
             </button>
           </div>
         </div>
         <div class="viewer__stage" id="viewerStage">
-          <canvas id="viewerCanvas"></canvas>
           <div class="viewer__empty" id="viewerEmpty">
             <div class="loader"></div>
-            <span>Mesh'ler çözülüyor…</span>
+            <span>exocad görüntüleyicisi yükleniyor…</span>
           </div>
-          <div class="viewer__legend" id="viewerLegend"></div>
-          <div class="viewer__hint">🖱️ Sürükle döndür · tekerlekle yakınlaştır · sağ tık taşı</div>
+          <iframe id="viewerFrame" title="exocad önizleme" allow="xr-spatial-tracking; fullscreen"></iframe>
         </div>
       </div>
 
       <!-- Mesh list -->
       <div class="panel">
         <div class="panel__head">
-          <h2 class="panel__title">Çıkarılan Mesh'ler</h2>
+          <h2 class="panel__title">Çıkarılan Parçalar</h2>
           <div class="panel__summary" id="panelSummary"></div>
         </div>
         <div class="toolbar">
@@ -115,8 +116,6 @@
   <div class="toast" id="toast" role="status"></div>
 
   <!-- libs -->
-  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="assets/vendor/lzma.js"></script>
   <script src="assets/vendor/ctm.js"></script>

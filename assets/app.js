@@ -1,6 +1,7 @@
 /* ==========================================================================
    ExoMesh Studio — app logic
-   exocad DentalCAD webview HTML  ->  extract OpenCTM meshes  ->  STL download
+   exocad DentalCAD webview HTML -> extract OpenCTM meshes -> STL download.
+   Names are recovered from exocad's color-definition table (type -> color).
    Everything runs client-side. No file ever leaves the browser.
    ========================================================================== */
 
@@ -10,16 +11,10 @@
   var $ = function (id) { return document.getElementById(id); };
 
   // ----- State -------------------------------------------------------------
-  var meshes = [];        // [{ name, vertices:Float32Array, indices:Uint32Array, tris, verts, color, threeMesh }]
+  var meshes = [];        // [{ name, type, color, vertices, indices, verts, tris }]
   var activeFile = null;
+  var blobUrl = null;
   var baseName = "model";
-
-  // three.js objects
-  var scene, camera, renderer, controls, rafId;
-  var meshGroup = null;
-
-  // mesh palette
-  var PALETTE = ["#ef895f", "#7c6cf0", "#41d9a4", "#f5c84c", "#ff6b9d", "#4cc3ff", "#b06ef7", "#8bd450", "#ff8a5c", "#5aa9ff"];
 
   // ----- Helpers -----------------------------------------------------------
   function escapeHtml(s) {
@@ -34,6 +29,29 @@
   }
   function sanitizeBase(name) {
     return (name || "model").replace(/\.(html?|htm)$/i, "").replace(/[^\w\-]+/g, "-").replace(/^-+|-+$/g, "") || "model";
+  }
+  function prettifyType(type) {
+    return type.replace(/([A-Z])/g, " $1").replace(/^ /, "").replace(/ +/g, " ");
+  }
+  var DISPLAY_NAMES = {
+    "OrthoModel": "Model",
+    "ModelPlatelessBase": "Model",
+    "ModelPlateTypeMixed": "Model",
+    "ModelPlateTypeHealthy": "Model",
+    "ModelPlatelessDie": "Die",
+    "ModelPlateTypeStump": "Stump",
+    "Antagonist": "Antagonist",
+    "UnsegmentedJaw": "Jaw",
+    "UnsegmentedTooth": "Tooth",
+    "MergedTooth": "Merged Tooth",
+    "MergedBridge": "Merged Bridge",
+    "MergedPontic": "Merged Pontic",
+    "MergedBar": "Merged Bar",
+    "AnatomicCrown": "Crown",
+    "AnatomicPontic": "Pontic"
+  };
+  function displayName(type) {
+    return DISPLAY_NAMES[type] || prettifyType(type);
   }
   function toast(msg) {
     var t = $("toast");
@@ -69,7 +87,6 @@
     return out.subarray(0, p);
   }
 
-  // Find all positions of a byte sequence
   function indexOfBytes(haystack, needle, from) {
     outer: for (var i = from; i <= haystack.length - needle.length; i++) {
       for (var j = 0; j < needle.length; j++) if (haystack[i + j] !== needle[j]) continue outer;
@@ -78,8 +95,92 @@
     return -1;
   }
 
+  // ----- Theme injection into the exocad viewer ----------------------------
+  var THEME_CSS = [
+    ":root{",
+    "--exo-purple:#17132a!important;",
+    "--exo-purple-dark:#0b0a12!important;",
+    "--exo-purple-light:#9da1ba!important;",
+    "--exo-purple-light2:#c4c7d6!important;",
+    "--exo-purple-light3:#878ba1!important;",
+    "--exo-orange:#7c6cf0!important;",
+    "--exo-grey-light:#efefee!important;",
+    "--o2:#b06ef7!important;",
+    "--o3:#8b7bf0!important;",
+    "--p1:#7c6cf0!important;",
+    "--p2:#8c82ab!important;",
+    "--p3:#6b5cd6!important;",
+    "--p4:#8c82ab!important;",
+    "--p5:#fbfaff!important;",
+    "--p6:#17132a!important;",
+    "--p7:#0b0a12!important;",
+    "--p8:#7c6cf0!important;",
+    "--p9:#e5e3e9!important;",
+    "--b1:#515b65!important;",
+    "--b2:#798896!important;",
+    "}",
+    "body{background:#0b0a12!important;}",
+    ".cad-trademark, .cad-multi-trademark-right, .cad-footer, .cad-header, .gui-sidebar{background:#17132a!important;}",
+    ".cad-button, .gui-sidebar-bar, .cad-sidebar, .cad-multi-message-background{background:#12101d!important;}"
+  ].join("");
+
+  function buildThemedHtml(html) {
+    // 3D background + border color (version-agnostic)
+    html = html.replace(/(DentalWebGL\.BackgroundColor\s*=\s*)0x[0-9A-Fa-f]+/g, "$10x0b0a14");
+    html = html.replace(/(DentalWebGL\.DesktopShowHideLeftBorderColor\s*=\s*)"[^"]*"/g, '$1"#7c6cf0"');
+    // inject theme CSS
+    var inject = '<style id="exomesh-theme">' + THEME_CSS + "</style>";
+    if (html.indexOf("</head>") !== -1) {
+      html = html.replace("</head>", inject + "</head>");
+    } else {
+      html = inject + html;
+    }
+    return html;
+  }
+
+  // ----- Name recovery: exocad color-definition table ----------------------
+  function extractColorList(html) {
+    var marker = "createColorDefinitionList=function(){return[";
+    var s = html.indexOf(marker);
+    if (s === -1) return [];
+    var arrStart = s + marker.length;
+    var e = html.indexOf("]}", arrStart);
+    var text = html.slice(arrStart, e + 1);
+    var re = /Type:"([^"]+)",Color:"(#[0-9A-Fa-f]{6})"/g;
+    var list = [], m;
+    while ((m = re.exec(text)) !== null) list.push({ type: m[1], color: m[2].toLowerCase() });
+    return list;
+  }
+
+  function buildColorMap(list) {
+    var map = {};
+    list.forEach(function (entry) { if (!map[entry.color]) map[entry.color] = entry.type; });
+    return map;
+  }
+
+  // type color lives right before the OCTM magic (descriptor). Scan backward.
+  function meshType(bytes, octmOffset, colorMap) {
+    // primary: known fixed offset in this format (100 bytes before OCTM)
+    var lo = octmOffset - 100;
+    if (lo >= 0 && lo + 2 < bytes.length) {
+      var hex = rgbHex(bytes[lo], bytes[lo + 1], bytes[lo + 2]);
+      if (colorMap[hex]) return colorMap[hex];
+    }
+    // fallback: scan the descriptor region
+    for (var i = octmOffset - 256; i < octmOffset - 2; i++) {
+      if (i < 0) continue;
+      var h2 = rgbHex(bytes[i], bytes[i + 1], bytes[i + 2]);
+      if (colorMap[h2]) return colorMap[h2];
+    }
+    return null;
+  }
+
+  function rgbHex(r, g, b) {
+    return "#" + ("0" + (r & 0xff).toString(16)).slice(-2) + ("0" + (g & 0xff).toString(16)).slice(-2) + ("0" + (b & 0xff).toString(16)).slice(-2);
+  }
+
   // ----- CTM extraction & decode ------------------------------------------
-  function extractMeshes(bytes) {
+  function extractMeshes(bytes, colorMap) {
     var magic = [0x4f, 0x43, 0x54, 0x4d]; // "OCTM"
     var offs = [], from = 0, pos;
     while ((pos = indexOfBytes(bytes, magic, from)) !== -1) { offs.push(pos); from = pos + 4; }
@@ -95,21 +196,33 @@
         var vertices = file.body.vertices;
         var indices = file.body.indices;
         if (!vertices || !indices || indices.length === 0) continue;
+        var type = meshType(bytes, start, colorMap);
         result.push({
-          name: "mesh_" + (i + 1),
+          type: type || "mesh_" + (i + 1),
+          color: colorMap ? colorForType(bytes, start) : null,
           vertices: vertices,
           indices: indices,
           verts: vertices.length / 3,
           tris: indices.length / 3
         });
-      } catch (e) {
-        // ignore malformed trailing chunk
-      }
+      } catch (e) { /* skip malformed */ }
     }
     // sort biggest first
     result.sort(function (a, b) { return b.tris - a.tris; });
-    result.forEach(function (m, idx) { m.name = "mesh_" + (idx + 1); m.color = PALETTE[idx % PALETTE.length]; });
+    // friendly names + dedupe
+    var seen = {};
+    result.forEach(function (m) {
+      var label = displayName(m.type);
+      seen[label] = (seen[label] || 0) + 1;
+      m.name = seen[label] > 1 ? label + "-" + seen[label] : label;
+    });
     return result;
+  }
+
+  function colorForType(bytes, octmOffset) {
+    var lo = octmOffset - 100;
+    if (lo >= 0 && lo + 2 < bytes.length) return rgbHex(bytes[lo], bytes[lo + 1], bytes[lo + 2]);
+    return "#7c6cf0";
   }
 
   // ----- STL (binary) ------------------------------------------------------
@@ -142,94 +255,19 @@
     return new Blob([buffer], { type: "model/stl" });
   }
 
-  // ----- 3D viewer ---------------------------------------------------------
-  function initViewer() {
-    if (renderer) return;
-    var stage = $("viewerStage");
-    var canvas = $("viewerCanvas");
-    renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.outputEncoding = THREE.sRGBEncoding;
-
-    scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b0a14);
-
-    camera = new THREE.PerspectiveCamera(50, 1, 0.1, 2000);
-    camera.position.set(60, 40, 80);
-
-    controls = new THREE.OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.08;
-
-    // lights
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x302a4d, 0.75));
-    var d1 = new THREE.DirectionalLight(0xffffff, 0.9); d1.position.set(80, 120, 60); scene.add(d1);
-    var d2 = new THREE.DirectionalLight(0xffffff, 0.4); d2.position.set(-60, -40, -80); scene.add(d2);
-
-    meshGroup = new THREE.Group();
-    scene.add(meshGroup);
-
-    function resize() {
-      var w = stage.clientWidth, h = stage.clientHeight;
-      renderer.setSize(w, h, false);
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-    }
-    window.addEventListener("resize", resize);
-    new ResizeObserver(resize).observe(stage);
-    resize();
-
-    function loop() {
-      rafId = requestAnimationFrame(loop);
-      controls.update();
-      renderer.render(scene, camera);
-    }
-    loop();
-  }
-
-  function addMeshToScene(m) {
-    initViewer();
-    var geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(m.vertices, 3));
-    geo.setIndex(new THREE.BufferAttribute(m.indices, 1));
-    geo.computeVertexNormals();
-    var mat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(m.color), roughness: 0.6, metalness: 0.05, flatShading: true, side: THREE.DoubleSide
-    });
-    var mesh = new THREE.Mesh(geo, mat);
-    mesh.name = m.name;
-    meshGroup.add(mesh);
-    m.threeMesh = mesh;
-  }
-
-  function fitCamera() {
-    if (!meshGroup || meshGroup.children.length === 0) return;
-    var box = new THREE.Box3().setFromObject(meshGroup);
-    var size = box.getSize(new THREE.Vector3());
-    var center = box.getCenter(new THREE.Vector3());
-    var maxDim = Math.max(size.x, size.y, size.z) || 1;
-    var fov = camera.fov * Math.PI / 180;
-    var dist = maxDim / (2 * Math.tan(fov / 2)) * 1.4;
-    camera.position.copy(center).add(new THREE.Vector3(dist * 0.6, dist * 0.45, dist));
-    camera.near = maxDim / 100;
-    camera.far = maxDim * 100;
-    camera.updateProjectionMatrix();
-    controls.target.copy(center);
-    controls.update();
-  }
-
-  // ----- Rendering the mesh list -------------------------------------------
+  // ----- Rendering ---------------------------------------------------------
   function renderMeshes() {
     var wrap = $("meshes");
     $("emptyMeshes").hidden = meshes.length > 0;
-    $("panelSummary").textContent = meshes.length + " mesh";
+    $("panelSummary").textContent = meshes.length + " parça";
     wrap.innerHTML = meshes.map(function (m, i) {
+      var label = m.name;
       return (
         '<div class="mesh" data-i="' + i + '">' +
           '<div class="mesh__check">✓</div>' +
           '<div class="mesh__dot" style="background:' + m.color + '"></div>' +
           '<div class="mesh__info">' +
-            '<div class="mesh__name">' + escapeHtml(m.name) + '</div>' +
+            '<div class="mesh__name">' + escapeHtml(label) + '</div>' +
             '<div class="mesh__stats">' + m.tris.toLocaleString("tr-TR") + ' üçgen · ' + m.verts.toLocaleString("tr-TR") + ' nokta</div>' +
           '</div>' +
           '<button class="btn btn--ghost btn--sm mesh__dl" data-i="' + i + '" title="STL indir">⬇ .stl</button>' +
@@ -238,15 +276,17 @@
     }).join("");
   }
 
-  function renderLegend() {
-    var lg = $("viewerLegend");
-    lg.innerHTML = meshes.map(function (m, i) {
-      return '<div class="lg-item" data-i="' + i + '"><span class="lg-dot" style="background:' + m.color + '"></span>' + escapeHtml(m.name) + '</div>';
-    }).join("");
-  }
-
   function selectedIndices() {
     return Array.from(document.querySelectorAll(".mesh.is-selected")).map(function (el) { return +el.dataset.i; });
+  }
+
+  // ----- Viewer (exocad's own HTML viewer in an iframe) --------------------
+  function loadViewer(blob) {
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    blobUrl = URL.createObjectURL(blob);
+    $("viewerEmpty").style.display = "flex";
+    $("viewerFrame").onload = function () { $("viewerEmpty").style.display = "none"; };
+    $("viewerFrame").src = blobUrl;
   }
 
   // ----- Actions -----------------------------------------------------------
@@ -267,28 +307,20 @@
         while ((m = re.exec(html)) !== null) b64 = m[1];
         if (!b64) throw new Error("m_Data bulunamadı");
 
+        var colorMap = buildColorMap(extractColorList(html));
         var bytes = base64ToBytes(b64);
-        meshes = extractMeshes(bytes);
+        meshes = extractMeshes(bytes, colorMap);
         if (!meshes.length) throw new Error("Mesh bulunamadı");
 
-        // render list & legend
         renderMeshes();
-        renderLegend();
-
-        // clear previous scene meshes
-        if (meshGroup) {
-          meshGroup.traverse(function (o) { if (o.isMesh) { o.geometry && o.geometry.dispose(); o.material && o.material.dispose(); } });
-          while (meshGroup.children.length) meshGroup.remove(meshGroup.children[0]);
-        }
-        meshes.forEach(addMeshToScene);
-        fitCamera();
-        $("viewerEmpty").style.display = "none";
+        var themedHtml = buildThemedHtml(html);
+        loadViewer(new Blob([themedHtml], { type: "text/html" }));
 
         $("hero").hidden = true;
         $("workspace").hidden = false;
         $("resetbar").hidden = false;
         $("workspace").scrollIntoView({ behavior: "smooth", block: "start" });
-        toast(meshes.length + " mesh çıkarıldı");
+        toast(meshes.length + " parça çıkarıldı");
       } catch (e) {
         toast("Hata: " + e.message);
       }
@@ -297,12 +329,11 @@
   }
 
   function resetAll() {
-    if (meshGroup) { while (meshGroup.children.length) meshGroup.remove(meshGroup.children[0]); }
+    if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+    $("viewerFrame").src = "about:blank";
     meshes = [];
     activeFile = null;
     $("meshes").innerHTML = "";
-    $("viewerLegend").innerHTML = "";
-    $("viewerEmpty").style.display = "flex";
     $("hero").hidden = false;
     $("workspace").hidden = true;
     $("resetbar").hidden = true;
@@ -311,8 +342,7 @@
 
   function downloadSingle(i) {
     var m = meshes[i];
-    var blob = buildBinaryStl(m);
-    downloadBlob(blob, baseName + "-" + m.name + ".stl");
+    downloadBlob(buildBinaryStl(m), baseName + "-" + m.name + ".stl");
     toast(m.name + " indirildi");
   }
 
@@ -325,7 +355,7 @@
     });
     zip.generateAsync({ type: "blob" }).then(function (blob) {
       downloadBlob(blob, baseName + "-meshes.zip");
-      toast(indices.length + " mesh ZIP olarak indirildi");
+      toast(indices.length + " parça ZIP olarak indirildi");
     });
   }
 
@@ -350,20 +380,11 @@
     if (f && /\.html?$/i.test(f.name)) handleFile(f);
   });
 
-  // mesh list interaction
   $("meshes").addEventListener("click", function (e) {
     var dl = e.target.closest(".mesh__dl");
     if (dl) { e.stopPropagation(); downloadSingle(+dl.dataset.i); return; }
     var row = e.target.closest(".mesh");
     if (row) row.classList.toggle("is-selected");
-  });
-
-  // legend toggles visibility
-  $("viewerLegend").addEventListener("click", function (e) {
-    var it = e.target.closest(".lg-item");
-    if (!it) return;
-    var m = meshes[+it.dataset.i];
-    if (m.threeMesh) { m.threeMesh.visible = !m.threeMesh.visible; it.classList.toggle("is-off", !m.threeMesh.visible); }
   });
 
   $("btnSelectAll").addEventListener("click", function () {
@@ -373,12 +394,15 @@
   });
   $("btnDownloadSelected").addEventListener("click", function () {
     var sel = selectedIndices();
-    if (!sel.length) return toast("Önce mesh seçin");
+    if (!sel.length) return toast("Önce parça seçin");
     downloadZip(sel);
   });
   $("btnDownloadAll").addEventListener("click", function () {
     if (!meshes.length) return;
     downloadZip(meshes.map(function (_, i) { return i; }));
+  });
+  $("btnOpenTab").addEventListener("click", function () {
+    if (blobUrl) window.open(blobUrl, "_blank");
   });
   $("btnFullscreen").addEventListener("click", function () {
     var s = $("viewerStage");
