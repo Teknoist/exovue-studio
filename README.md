@@ -1,55 +1,33 @@
-# 🦷 ExoVue Studio
+# 🦷 ExoMesh Studio
 
-**DentalCAD webview HTML dosyalarını yükleyin, gömülü stilleri çıkarın ve modeli 3D olarak görüntüleyin.**
+**exocad DentalCAD webview HTML → STL dönüştürücü.**
 
-ExoVue Studio, [exocad](https://exocad.com/) DentalCAD'in ürettiği `webview` HTML dosyalarını tarayıcıda açıp içindeki her şeyi **tamamen istemci tarafında** (hiçbir dosya sunucuya yüklenmez) ayrıştıran modern bir araçtır.
+exocad'in ürettiği `.html` dosyalarının içine gömülü 3D mesh'leri (OpenCTM formatında) tarayıcıda çözer, **3D** önizleme sunar ve **STL** olarak indirir. Tüm işlem istemci tarafında çalışır — dosyanız hiçbir sunucuya yüklenmez.
 
-## ✨ Neler yapıyor?
+## ✨ Özellikler
 
-- 🎨 **Renk paleti çıkarma** — `:root` içindeki tüm CSS değişkenlerini (`--exo-purple`, `--exo-orange`, `--grey-*` …) renk kartları olarak listeler, kopyalar ve `.css` olarak indirir.
-- 📦 **CSS blokları** — HTML içindeki tüm `<style>` bloklarını tek tek önizler ve indirilebilir hâle getirir.
-- 🧩 **Sınıf ayrıştırma** — `.cad-slider-widget` gibi tüm sınıfları bulur, seçtiklerinizi tek tıkla `.css` olarak indirir.
-- 🧊 **3D görüntüleyici** — Dosyanın içindeki gömülü Three.js sahnesini iframe içinde canlı çalıştırır (döndür, yakınlaştır, tam ekran).
-- 🔍 **Arama & filtre** — Renk, blok ve sınıf listelerinde anında arama.
-- 🔒 **Gizlilik** — Dosyanız hiçbir sunucuya gönderilmez; tüm işlem tarayıcınızda gerçekleşir.
+- 🧩 **Mesh ayrıştırma** — `DentalWebGL.m_Data` içindeki base64 veriyi çözer, `OCTM` ile ayrılmış tüm OpenCTM mesh'leri çıkarır (MG1/MG2/RAW sıkıştırma destekli).
+- 🧊 **3D önizleme** — Çözülen mesh'leri Three.js ile döndürülebilir, yakınlaştırılabilir sahne olarak gösterir; her mesh ayrı renk ve görünürlük anahtarıyla.
+- 📐 **Binary STL** — Doğru yüz normalleriyle binary STL üretir (3D baskı / CAD uyumlu).
+- 📦 **Toplu indir** — Seçilen mesh'leri veya tümünü tek `.zip` olarak indirir (JSZip).
+
+## 🔧 Teknik
+
+- OpenCTM çözücü: [js-openctm](https://github.com/juanmellado/js-openctm) (`assets/vendor/ctm.js` + `lzma.js`, MIT/LGPL).
+- Üç boyutlu görüntüleme: Three.js + OrbitControls (CDN).
+- STL üretimi: tarayıcı içi binary writer.
 
 ## 🚀 GitHub Pages'e yükleme
 
-1. Bu klasörü bir GitHub deposuna koyun (veya doğrudan `git push` edin):
-
+1. Bu klasörü bir GitHub deposuna it:
    ```bash
-   git init
-   git add .
-   git commit -m "ExoVue Studio"
+   git init && git add . && git commit -m "ExoMesh Studio"
    git branch -M main
    git remote add origin https://github.com/KULLANICI/REPO.git
    git push -u origin main
    ```
-
-2. Depo ayarlarında **Settings → Pages** bölümüne gidin.
-3. **Source** olarak `Deploy from a branch` seçin, dal olarak `main` ve klasör olarak `/ (root)` işaretleyin.
-4. **Save** deyin. Birkaç dakika içinde siteniz `https://KULLANICI.github.io/REPO/` adresinde yayında olur.
-
-Alternatif olarak tüm `index.html`, `assets/style.css` ve `assets/app.js` dosyalarını GitHub'daki dosya düzenleyiciden tek tek ekleyebilirsiniz — klasör yapısını koruyun.
-
-## 📁 Dosya yapısı
-
-```
-.
-├── index.html          # Arayüz
-├── assets/
-│   ├── style.css       # Uygulama stilleri
-│   └── app.js          # Ayrıştırma + 3D + indirme mantığı
-└── README.md
-```
-
-## 🧪 Nasıl kullanılır?
-
-1. `index.html`'i açın (veya GitHub Pages'te yayınlayın).
-2. exocad webview `.html` dosyanızı bırakma alanına sürükleyin ya da seçin.
-3. Sol tarafta model **3D** olarak yüklenir.
-4. Sağ panelden renk paletini, CSS bloklarını veya sınıfları inceleyin ve dilediğinizi indirin.
+2. **Settings → Pages → Deploy from a branch → `main` / `/ (root)` → Save**.
 
 ## ⚠️ Not
 
-Bu araç, exocad DentalCAD webview dosyalarının **içeriğini görüntülemek ve stil parçalarını indirmek** için tasarlanmıştır. Telif hakkı ve lisans koşulları, dosyaların sahibi olan exocad GmbH'ye aittir. Bu araç resmi bir exocad ürünü değildir ve exocad ile bağlantısı yoktur.
+Bu araç, exocad DentalCAD webview dosyalarındaki 3D veriyi görüntülemek ve STL'e dönüştürmek için tasarlanmıştır. Telif hakkı ve lisans koşulları dosyaların sahibi olan exocad GmbH'ye aittir. Bu araç resmi bir exocad ürünü değildir.

@@ -1,452 +1,389 @@
 /* ==========================================================================
-   ExoVue Studio — app logic
-   Upload an exocad DentalCAD webview HTML, extract styles, view in 3D, download.
+   ExoMesh Studio — app logic
+   exocad DentalCAD webview HTML  ->  extract OpenCTM meshes  ->  STL download
    Everything runs client-side. No file ever leaves the browser.
    ========================================================================== */
 
 (function () {
   "use strict";
 
-  // ----- DOM references ----------------------------------------------------
-  const $ = (id) => document.getElementById(id);
-  const dropzone = $("dropzone");
-  const fileInput = $("fileInput");
-  const hero = $("hero");
-  const workspace = $("workspace");
-  const resetbar = $("resetbar");
-  const viewerStage = $("viewerStage");
-  const viewerEmpty = $("viewerEmpty");
-  const viewerFrame = $("viewerFrame");
-  const viewerHint = $("viewerHint");
-  const fileNameChip = $("fileNameChip");
-  const fileSize = $("fileSize");
-  const panelSummary = $("panelSummary");
+  var $ = function (id) { return document.getElementById(id); };
 
   // ----- State -------------------------------------------------------------
-  let activeFile = null;
-  let blobUrl = null;
-  let styleBlocks = [];   // [{ css, label, size }]
-  let variables = [];     // [{ name, value, isColor }]
-  let classes = [];       // [{ name, rules: [{selector, body}] }]
-  let baseName = "styles";
+  var meshes = [];        // [{ name, vertices:Float32Array, indices:Uint32Array, tris, verts, color, threeMesh }]
+  var activeFile = null;
+  var baseName = "model";
+
+  // three.js objects
+  var scene, camera, renderer, controls, rafId;
+  var meshGroup = null;
+
+  // mesh palette
+  var PALETTE = ["#ef895f", "#7c6cf0", "#41d9a4", "#f5c84c", "#ff6b9d", "#4cc3ff", "#b06ef7", "#8bd450", "#ff8a5c", "#5aa9ff"];
 
   // ----- Helpers -----------------------------------------------------------
   function escapeHtml(s) {
-    return s.replace(/[&<>"']/g, (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-    );
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
   }
-
   function humanSize(bytes) {
     if (bytes < 1024) return bytes + " B";
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
     return (bytes / (1024 * 1024)).toFixed(2) + " MB";
   }
-
   function sanitizeBase(name) {
-    return (name || "styles")
-      .replace(/\.(html?|htm)$/i, "")
-      .replace(/[^\w\-]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "styles";
+    return (name || "model").replace(/\.(html?|htm)$/i, "").replace(/[^\w\-]+/g, "-").replace(/^-+|-+$/g, "") || "model";
   }
-
   function toast(msg) {
-    const t = $("toast");
+    var t = $("toast");
     t.innerHTML = '<span class="toast__dot"></span>' + escapeHtml(msg);
     t.classList.add("is-show");
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => t.classList.remove("is-show"), 2400);
+    toast._t = setTimeout(function () { t.classList.remove("is-show"); }, 2600);
+  }
+  function downloadBlob(blob, filename) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
   }
 
-  function downloadText(filename, text, mime) {
-    const blob = new Blob([text], { type: mime || "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
-  async function copyText(text) {
-    try {
-      await navigator.clipboard.writeText(text);
-      toast("Panoya kopyalandı");
-    } catch (e) {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand("copy"); toast("Panoya kopyalandı"); }
-      catch (_) { toast("Kopyalanamadı"); }
-      ta.remove();
+  function base64ToBytes(b64) {
+    b64 = b64.replace(/\s+/g, "");
+    var lut = new Int16Array(256).fill(-1);
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (var k = 0; k < 64; k++) lut[chars.charCodeAt(k)] = k;
+    var len = b64.length, out = new Uint8Array(Math.floor(len * 3 / 4)), p = 0;
+    var buf = 0, bits = 0;
+    for (var j = 0; j < len; j++) {
+      var c = b64.charCodeAt(j);
+      if (c === 0x3d) break; // '='
+      var v = lut[c];
+      if (v < 0) continue;
+      buf = (buf << 6) | v;
+      bits += 6;
+      if (bits >= 8) { bits -= 8; out[p++] = (buf >> bits) & 0xff; }
     }
+    return out.subarray(0, p);
   }
 
-  // ----- CSS parsing -------------------------------------------------------
-  function parseCssRules(css) {
-    const rules = [];
-    let i = 0;
-    const n = css.length;
-    while (i < n) {
-      while (i < n && /\s/.test(css[i])) i++;
-      const open = css.indexOf("{", i);
-      if (open === -1) break;
-      let depth = 0, j = open;
-      for (; j < n; j++) {
-        if (css[j] === "{") depth++;
-        else if (css[j] === "}") { depth--; if (depth === 0) break; }
-      }
-      if (j >= n) break;
-      const selector = css.slice(i, open).trim();
-      const body = css.slice(open + 1, j).trim();
-      if (selector && selector.startsWith("@")) {
-        if (/^@media/i.test(selector)) rules.push(...parseCssRules(body));
-      } else if (selector && body) {
-        rules.push({ selector, body });
-      }
-      i = j + 1;
+  // Find all positions of a byte sequence
+  function indexOfBytes(haystack, needle, from) {
+    outer: for (var i = from; i <= haystack.length - needle.length; i++) {
+      for (var j = 0; j < needle.length; j++) if (haystack[i + j] !== needle[j]) continue outer;
+      return i;
     }
-    return rules;
+    return -1;
   }
 
-  function isColorValue(val) {
-    return (
-      /^#([0-9a-f]{3,8})$/i.test(val) ||
-      /^(rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch)\(/i.test(val) ||
-      /^(transparent|currentcolor)$/i.test(val)
-    );
-  }
+  // ----- CTM extraction & decode ------------------------------------------
+  function extractMeshes(bytes) {
+    var magic = [0x4f, 0x43, 0x54, 0x4d]; // "OCTM"
+    var offs = [], from = 0, pos;
+    while ((pos = indexOfBytes(bytes, magic, from)) !== -1) { offs.push(pos); from = pos + 4; }
 
-  function extractVariables(css) {
-    const map = new Map();
-    const re = /(--[\w-]+)\s*:\s*([^;{}]+)(?:;|\})/g;
-    let m;
-    while ((m = re.exec(css)) !== null) {
-      const name = m[1];
-      const value = m[2].trim();
-      if (!map.has(name)) map.set(name, value);
-    }
-    return Array.from(map, ([name, value]) => ({ name, value, isColor: isColorValue(value) }));
-  }
-
-  function extractClasses(css) {
-    const rules = parseCssRules(css);
-    const classMap = new Map(); // name -> { name, rules: [] }
-    const nameRe = /\.[a-zA-Z][\w-]*/g;
-    for (const rule of rules) {
-      const parts = rule.selector.split(",");
-      for (const part of parts) {
-        const seg = part.trim();
-        if (!seg) continue;
-        let mm;
-        nameRe.lastIndex = 0;
-        while ((mm = nameRe.exec(seg)) !== null) {
-          const name = mm[0].slice(1); // strip leading '.'
-          if (!classMap.has(name)) classMap.set(name, { name, rules: [] });
-          classMap.get(name).rules.push({ selector: seg, body: rule.body });
-        }
+    var result = [];
+    for (var i = 0; i < offs.length; i++) {
+      var start = offs[i];
+      var end = i + 1 < offs.length ? offs[i + 1] : bytes.length;
+      var chunk = bytes.subarray(start, end);
+      try {
+        var stream = new CTM.Stream(chunk);
+        var file = new CTM.File(stream);
+        var vertices = file.body.vertices;
+        var indices = file.body.indices;
+        if (!vertices || !indices || indices.length === 0) continue;
+        result.push({
+          name: "mesh_" + (i + 1),
+          vertices: vertices,
+          indices: indices,
+          verts: vertices.length / 3,
+          tris: indices.length / 3
+        });
+      } catch (e) {
+        // ignore malformed trailing chunk
       }
     }
-    // Deduplicate identical rules per class
-    const result = Array.from(classMap.values()).map((cls) => {
-      const seen = new Set();
-      cls.rules = cls.rules.filter((r) => {
-        const key = r.selector + "\u0000" + r.body;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-      return cls;
-    });
-    result.sort((a, b) => a.name.localeCompare(b.name));
+    // sort biggest first
+    result.sort(function (a, b) { return b.tris - a.tris; });
+    result.forEach(function (m, idx) { m.name = "mesh_" + (idx + 1); m.color = PALETTE[idx % PALETTE.length]; });
     return result;
   }
 
-  function blockLabel(css) {
-    if (/--exo-/.test(css) || (/:root/.test(css) && /--\w/.test(css))) return "Tema · CSS değişkenleri";
-    if (/\.cad-/.test(css)) return "GUI bileşenleri";
-    return "Stil bloğu";
+  // ----- STL (binary) ------------------------------------------------------
+  function buildBinaryStl(mesh) {
+    var triCount = mesh.indices.length / 3;
+    var buffer = new ArrayBuffer(84 + triCount * 50);
+    var dv = new DataView(buffer);
+    var hdr = "ExoMesh Studio — " + mesh.name;
+    for (var h = 0; h < 80; h++) dv.setUint8(h, h < hdr.length ? hdr.charCodeAt(h) : 0x20);
+    dv.setUint32(80, triCount, true);
+    var off = 84, v = mesh.vertices, idx = mesh.indices;
+    for (var i = 0; i < idx.length; i += 3) {
+      var a = idx[i] * 3, b = idx[i + 1] * 3, c = idx[i + 2] * 3;
+      var ax = v[a], ay = v[a + 1], az = v[a + 2];
+      var bx = v[b], by = v[b + 1], bz = v[b + 2];
+      var cx = v[c], cy = v[c + 1], cz = v[c + 2];
+      var ux = bx - ax, uy = by - ay, uz = bz - az;
+      var vx = cx - ax, vy = cy - ay, vz = cz - az;
+      var nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      var l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      nx /= l; ny /= l; nz /= l;
+      dv.setFloat32(off, nx, true); off += 4;
+      dv.setFloat32(off, ny, true); off += 4;
+      dv.setFloat32(off, nz, true); off += 4;
+      dv.setFloat32(off, ax, true); off += 4; dv.setFloat32(off, ay, true); off += 4; dv.setFloat32(off, az, true); off += 4;
+      dv.setFloat32(off, bx, true); off += 4; dv.setFloat32(off, by, true); off += 4; dv.setFloat32(off, bz, true); off += 4;
+      dv.setFloat32(off, cx, true); off += 4; dv.setFloat32(off, cy, true); off += 4; dv.setFloat32(off, cz, true); off += 4;
+      dv.setUint16(off, 0, true); off += 2;
+    }
+    return new Blob([buffer], { type: "model/stl" });
   }
 
-  function processHtml(htmlText) {
-    const doc = new DOMParser().parseFromString(htmlText, "text/html");
+  // ----- 3D viewer ---------------------------------------------------------
+  function initViewer() {
+    if (renderer) return;
+    var stage = $("viewerStage");
+    var canvas = $("viewerCanvas");
+    renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputEncoding = THREE.sRGBEncoding;
 
-    // Style blocks
-    styleBlocks = Array.from(doc.querySelectorAll("style")).map((el, idx) => {
-      const css = el.textContent.trim();
-      return { css, idx, label: blockLabel(css), size: css.length };
-    }).filter((b) => b.css.length > 0);
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0a14);
 
-    const allCss = styleBlocks.map((b) => b.css).join("\n\n");
+    camera = new THREE.PerspectiveCamera(50, 1, 0.1, 2000);
+    camera.position.set(60, 40, 80);
 
-    // Also surface <link rel="stylesheet"> (informational, non-inline)
-    const linkCount = doc.querySelectorAll('link[rel="stylesheet"]').length;
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
 
-    variables = extractVariables(allCss);
-    classes = extractClasses(allCss);
+    // lights
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x302a4d, 0.75));
+    var d1 = new THREE.DirectionalLight(0xffffff, 0.9); d1.position.set(80, 120, 60); scene.add(d1);
+    var d2 = new THREE.DirectionalLight(0xffffff, 0.4); d2.position.set(-60, -40, -80); scene.add(d2);
 
-    return { linkCount, docTitle: doc.title || "" };
+    meshGroup = new THREE.Group();
+    scene.add(meshGroup);
+
+    function resize() {
+      var w = stage.clientWidth, h = stage.clientHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+    window.addEventListener("resize", resize);
+    new ResizeObserver(resize).observe(stage);
+    resize();
+
+    function loop() {
+      rafId = requestAnimationFrame(loop);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    loop();
   }
 
-  // ----- Rendering ---------------------------------------------------------
-  function renderSummary() {
-    const colorCount = variables.filter((v) => v.isColor).length;
-    const parts = [
-      variables.length + " değişken",
-      colorCount + " renk",
-      styleBlocks.length + " blok",
-      classes.length + " sınıf",
-    ];
-    panelSummary.textContent = parts.join(" · ");
-    $("countColors").textContent = colorCount;
-    $("countBlocks").textContent = styleBlocks.length;
-    $("countClasses").textContent = classes.length;
+  function addMeshToScene(m) {
+    initViewer();
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(m.vertices, 3));
+    geo.setIndex(new THREE.BufferAttribute(m.indices, 1));
+    geo.computeVertexNormals();
+    var mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(m.color), roughness: 0.6, metalness: 0.05, flatShading: true, side: THREE.DoubleSide
+    });
+    var mesh = new THREE.Mesh(geo, mat);
+    mesh.name = m.name;
+    meshGroup.add(mesh);
+    m.threeMesh = mesh;
   }
 
-  function renderColors(filter) {
-    const wrap = $("swatches");
-    const list = variables.filter((v) => v.isColor).filter((v) =>
-      !filter || v.name.toLowerCase().includes(filter) || v.value.toLowerCase().includes(filter)
-    );
-    $("emptyColors").hidden = list.length > 0;
-    wrap.innerHTML = list.map((v) => {
-      const chip = isOpaqueHex(v.value)
-        ? `<div class="swatch__chip" style="background:${escapeHtml(v.value)}"></div>`
-        : `<div class="swatch__chip swatch__chip--transparent" style="background:${escapeHtml(v.value)}"></div>`;
-      return `
-        <div class="swatch" title="${escapeHtml(v.name)}: ${escapeHtml(v.value)}">
-          ${chip}
-          <button class="swatch__copy" data-copy="${escapeHtml(v.value)}" title="Kopyala">⧉</button>
-          <div class="swatch__body">
-            <div class="swatch__name">${escapeHtml(v.name)}</div>
-            <div class="swatch__value">${escapeHtml(v.value)}</div>
-          </div>
-        </div>`;
+  function fitCamera() {
+    if (!meshGroup || meshGroup.children.length === 0) return;
+    var box = new THREE.Box3().setFromObject(meshGroup);
+    var size = box.getSize(new THREE.Vector3());
+    var center = box.getCenter(new THREE.Vector3());
+    var maxDim = Math.max(size.x, size.y, size.z) || 1;
+    var fov = camera.fov * Math.PI / 180;
+    var dist = maxDim / (2 * Math.tan(fov / 2)) * 1.4;
+    camera.position.copy(center).add(new THREE.Vector3(dist * 0.6, dist * 0.45, dist));
+    camera.near = maxDim / 100;
+    camera.far = maxDim * 100;
+    camera.updateProjectionMatrix();
+    controls.target.copy(center);
+    controls.update();
+  }
+
+  // ----- Rendering the mesh list -------------------------------------------
+  function renderMeshes() {
+    var wrap = $("meshes");
+    $("emptyMeshes").hidden = meshes.length > 0;
+    $("panelSummary").textContent = meshes.length + " mesh";
+    wrap.innerHTML = meshes.map(function (m, i) {
+      return (
+        '<div class="mesh" data-i="' + i + '">' +
+          '<div class="mesh__check">✓</div>' +
+          '<div class="mesh__dot" style="background:' + m.color + '"></div>' +
+          '<div class="mesh__info">' +
+            '<div class="mesh__name">' + escapeHtml(m.name) + '</div>' +
+            '<div class="mesh__stats">' + m.tris.toLocaleString("tr-TR") + ' üçgen · ' + m.verts.toLocaleString("tr-TR") + ' nokta</div>' +
+          '</div>' +
+          '<button class="btn btn--ghost btn--sm mesh__dl" data-i="' + i + '" title="STL indir">⬇ .stl</button>' +
+        '</div>'
+      );
     }).join("");
   }
 
-  function isOpaqueHex(val) {
-    return /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(val) || /^(rgb|hsl)\(/i.test(val);
-  }
-
-  function renderBlocks(filter) {
-    const wrap = $("blocks");
-    const list = styleBlocks.filter((b) => !filter || b.css.toLowerCase().includes(filter));
-    $("emptyBlocks").hidden = list.length > 0;
-    wrap.innerHTML = list.map((b) => `
-      <div class="block" data-idx="${b.idx}">
-        <div class="block__head">
-          <span class="block__idx">#${b.idx + 1}</span>
-          <span class="block__label">${escapeHtml(b.label)}</span>
-          <span class="block__size">${humanSize(b.size)}</span>
-          <button class="btn btn--ghost btn--sm" data-download-block="${b.idx}" title="İndir">⬇</button>
-          <span class="block__chev">▶</span>
-        </div>
-        <pre class="block__pre"><code>${escapeHtml(b.css)}</code></pre>
-      </div>`).join("");
-  }
-
-  function renderClasses(filter) {
-    const wrap = $("classes");
-    const list = classes.filter((c) => !filter || c.name.toLowerCase().includes(filter));
-    $("emptyClasses").hidden = list.length > 0;
-    wrap.innerHTML = list.map((c) => {
-      const props = c.rules.length === 1
-        ? c.rules[0].body.replace(/\s+/g, " ").slice(0, 90)
-        : c.rules.length + " kural";
-      return `
-        <div class="cls" data-name="${escapeHtml(c.name)}">
-          <div class="cls__check">✓</div>
-          <span class="cls__name">.${escapeHtml(c.name)}</span>
-          <span class="cls__props">${escapeHtml(props)}</span>
-          <span class="cls__arrow">›</span>
-        </div>`;
+  function renderLegend() {
+    var lg = $("viewerLegend");
+    lg.innerHTML = meshes.map(function (m, i) {
+      return '<div class="lg-item" data-i="' + i + '"><span class="lg-dot" style="background:' + m.color + '"></span>' + escapeHtml(m.name) + '</div>';
     }).join("");
   }
 
-  // ----- 3D viewer --------------------------------------------------------
-  function load3D(file) {
-    if (blobUrl) URL.revokeObjectURL(blobUrl);
-    blobUrl = URL.createObjectURL(file);
-    viewerEmpty.style.display = "flex";
-    viewerFrame.onload = () => { viewerEmpty.style.display = "none"; };
-    viewerFrame.src = blobUrl;
+  function selectedIndices() {
+    return Array.from(document.querySelectorAll(".mesh.is-selected")).map(function (el) { return +el.dataset.i; });
   }
 
   // ----- Actions -----------------------------------------------------------
   function handleFile(file) {
     if (!file) return;
-    if (!/\.html?$/i.test(file.name)) {
-      toast("Lütfen .html veya .htm dosyası seç");
-      return;
-    }
+    if (!/\.html?$/i.test(file.name)) { toast("Lütfen .html veya .htm dosyası seç"); return; }
     activeFile = file;
     baseName = sanitizeBase(file.name);
+    $("fileNameChip").textContent = file.name;
+    $("fileSize").textContent = humanSize(file.size);
 
-    fileNameChip.textContent = file.name;
-    fileSize.textContent = humanSize(file.size);
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var html = reader.result;
+        var re = /DentalWebGL\.m_Data\s*=\s*\{["']data["']:\s*["']([A-Za-z0-9+/=]+)["']\s*\}/g;
+        var m, b64 = null;
+        while ((m = re.exec(html)) !== null) b64 = m[1];
+        if (!b64) throw new Error("m_Data bulunamadı");
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      processHtml(reader.result);
-      renderSummary();
-      renderColors("");
-      renderBlocks("");
-      renderClasses("");
-      $("searchColors").value = "";
-      $("searchBlocks").value = "";
-      $("searchClasses").value = "";
-      // switch to colors tab
-      activateTab("colors");
+        var bytes = base64ToBytes(b64);
+        meshes = extractMeshes(bytes);
+        if (!meshes.length) throw new Error("Mesh bulunamadı");
 
-      hero.hidden = true;
-      workspace.hidden = false;
-      resetbar.hidden = false;
-      workspace.scrollIntoView({ behavior: "smooth", block: "start" });
-      load3D(file);
+        // render list & legend
+        renderMeshes();
+        renderLegend();
+
+        // clear previous scene meshes
+        if (meshGroup) {
+          meshGroup.traverse(function (o) { if (o.isMesh) { o.geometry && o.geometry.dispose(); o.material && o.material.dispose(); } });
+          while (meshGroup.children.length) meshGroup.remove(meshGroup.children[0]);
+        }
+        meshes.forEach(addMeshToScene);
+        fitCamera();
+        $("viewerEmpty").style.display = "none";
+
+        $("hero").hidden = true;
+        $("workspace").hidden = false;
+        $("resetbar").hidden = false;
+        $("workspace").scrollIntoView({ behavior: "smooth", block: "start" });
+        toast(meshes.length + " mesh çıkarıldı");
+      } catch (e) {
+        toast("Hata: " + e.message);
+      }
     };
     reader.readAsText(file);
   }
 
   function resetAll() {
-    if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+    if (meshGroup) { while (meshGroup.children.length) meshGroup.remove(meshGroup.children[0]); }
+    meshes = [];
     activeFile = null;
-    viewerFrame.src = "about:blank";
-    hero.hidden = false;
-    workspace.hidden = true;
-    resetbar.hidden = true;
+    $("meshes").innerHTML = "";
+    $("viewerLegend").innerHTML = "";
+    $("viewerEmpty").style.display = "flex";
+    $("hero").hidden = false;
+    $("workspace").hidden = true;
+    $("resetbar").hidden = true;
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  function selectedClasses() {
-    return Array.from(document.querySelectorAll(".cls.is-selected")).map((el) => el.dataset.name);
+  function downloadSingle(i) {
+    var m = meshes[i];
+    var blob = buildBinaryStl(m);
+    downloadBlob(blob, baseName + "-" + m.name + ".stl");
+    toast(m.name + " indirildi");
   }
 
-  function buildSelectedCss(names) {
-    const set = new Set(names);
-    const parts = [];
-    for (const c of classes) {
-      if (!set.has(c.name)) continue;
-      for (const r of c.rules) parts.push(r.selector + " {\n  " + r.body + "\n}");
-    }
-    return "/* ExoVue Studio — seçili sınıflar */\n" + parts.join("\n\n") + "\n";
-  }
-
-  function buildThemeCss() {
-    const decls = variables.map((v) => "  " + v.name + ": " + v.value + ";").join("\n");
-    return "/* ExoVue Studio — çıkarılan tema */\n:root {\n" + decls + "\n}\n";
-  }
-
-  function buildAllCss() {
-    return "/* ExoVue Studio — tüm stiller */\n" +
-      styleBlocks.map((b) => "/* --- " + b.label + " --- */\n" + b.css).join("\n\n") + "\n";
-  }
-
-  // ----- Tabs --------------------------------------------------------------
-  function activateTab(name) {
-    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("is-active", t.dataset.tab === name));
-    document.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("is-active", p.id === "pane-" + name));
+  function downloadZip(indices) {
+    if (!window.JSZip) { toast("JSZip yüklenemedi"); return; }
+    var zip = new JSZip();
+    indices.forEach(function (i) {
+      var m = meshes[i];
+      zip.file(baseName + "-" + m.name + ".stl", buildBinaryStl(m));
+    });
+    zip.generateAsync({ type: "blob" }).then(function (blob) {
+      downloadBlob(blob, baseName + "-meshes.zip");
+      toast(indices.length + " mesh ZIP olarak indirildi");
+    });
   }
 
   // ----- Events ------------------------------------------------------------
-  dropzone.addEventListener("click", () => fileInput.click());
-  dropzone.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
-  });
-  fileInput.addEventListener("change", () => handleFile(fileInput.files[0]));
+  var dropzone = $("dropzone"), fileInput = $("fileInput");
+  dropzone.addEventListener("click", function () { fileInput.click(); });
+  dropzone.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); } });
+  fileInput.addEventListener("change", function () { handleFile(fileInput.files[0]); });
 
-  ["dragenter", "dragover"].forEach((ev) =>
-    dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.add("is-drag"); })
-  );
-  ["dragleave", "drop"].forEach((ev) =>
-    dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.remove("is-drag"); })
-  );
-  dropzone.addEventListener("drop", (e) => {
-    const f = e.dataTransfer.files && e.dataTransfer.files[0];
-    handleFile(f);
+  ["dragenter", "dragover"].forEach(function (ev) {
+    dropzone.addEventListener(ev, function (e) { e.preventDefault(); dropzone.classList.add("is-drag"); });
   });
+  ["dragleave", "drop"].forEach(function (ev) {
+    dropzone.addEventListener(ev, function (e) { e.preventDefault(); dropzone.classList.remove("is-drag"); });
+  });
+  dropzone.addEventListener("drop", function (e) { handleFile(e.dataTransfer.files && e.dataTransfer.files[0]); });
 
-  // Global drag & drop (anywhere on page)
-  window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("drop", (e) => {
+  window.addEventListener("dragover", function (e) { e.preventDefault(); });
+  window.addEventListener("drop", function (e) {
     e.preventDefault();
-    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    var f = e.dataTransfer.files && e.dataTransfer.files[0];
     if (f && /\.html?$/i.test(f.name)) handleFile(f);
   });
 
-  // Tabs
-  document.querySelectorAll(".tab").forEach((t) =>
-    t.addEventListener("click", () => activateTab(t.dataset.tab))
-  );
-
-  // Search
-  $("searchColors").addEventListener("input", (e) => renderColors(e.target.value.toLowerCase()));
-  $("searchBlocks").addEventListener("input", (e) => renderBlocks(e.target.value.toLowerCase()));
-  $("searchClasses").addEventListener("input", (e) => renderClasses(e.target.value.toLowerCase()));
-
-  // Blocks: expand / download (event delegation)
-  $("blocks").addEventListener("click", (e) => {
-    const dl = e.target.closest("[data-download-block]");
-    if (dl) {
-      const idx = +dl.dataset.downloadBlock;
-      const b = styleBlocks.find((x) => x.idx === idx);
-      if (b) { downloadText(baseName + "-block-" + (idx + 1) + ".css", b.css, "text/css;charset=utf-8"); toast("Blok #" + (idx + 1) + " indirildi"); }
-      return;
-    }
-    const head = e.target.closest(".block__head");
-    if (head) head.parentElement.classList.toggle("is-open");
-  });
-
-  // Classes: selection (event delegation)
-  $("classes").addEventListener("click", (e) => {
-    const row = e.target.closest(".cls");
+  // mesh list interaction
+  $("meshes").addEventListener("click", function (e) {
+    var dl = e.target.closest(".mesh__dl");
+    if (dl) { e.stopPropagation(); downloadSingle(+dl.dataset.i); return; }
+    var row = e.target.closest(".mesh");
     if (row) row.classList.toggle("is-selected");
   });
 
-  // Swatch copy (event delegation)
-  $("swatches").addEventListener("click", (e) => {
-    const btn = e.target.closest("[data-copy]");
-    if (btn) copyText(btn.dataset.copy);
+  // legend toggles visibility
+  $("viewerLegend").addEventListener("click", function (e) {
+    var it = e.target.closest(".lg-item");
+    if (!it) return;
+    var m = meshes[+it.dataset.i];
+    if (m.threeMesh) { m.threeMesh.visible = !m.threeMesh.visible; it.classList.toggle("is-off", !m.threeMesh.visible); }
   });
 
-  // Toolbar buttons
-  $("btnDownloadTheme").addEventListener("click", () => {
-    if (!variables.length) return toast("Değişken bulunamadı");
-    downloadText(baseName + "-theme.css", buildThemeCss(), "text/css;charset=utf-8");
-    toast("Tema indirildi");
+  $("btnSelectAll").addEventListener("click", function () {
+    var rows = document.querySelectorAll(".mesh");
+    var all = rows.length && Array.from(rows).every(function (r) { return r.classList.contains("is-selected"); });
+    rows.forEach(function (r) { r.classList.toggle("is-selected", !all); });
   });
-  $("btnCopyVars").addEventListener("click", () => {
-    if (!variables.length) return toast("Değişken bulunamadı");
-    copyText(buildThemeCss());
+  $("btnDownloadSelected").addEventListener("click", function () {
+    var sel = selectedIndices();
+    if (!sel.length) return toast("Önce mesh seçin");
+    downloadZip(sel);
   });
-  $("btnDownloadAllCss").addEventListener("click", () => {
-    if (!styleBlocks.length) return toast("Stil bloğu bulunamadı");
-    downloadText(baseName + "-all.css", buildAllCss(), "text/css;charset=utf-8");
-    toast("Tüm CSS indirildi");
+  $("btnDownloadAll").addEventListener("click", function () {
+    if (!meshes.length) return;
+    downloadZip(meshes.map(function (_, i) { return i; }));
   });
-  $("btnSelectAll").addEventListener("click", () => {
-    const rows = document.querySelectorAll(".cls");
-    const all = rows.length && Array.from(rows).every((r) => r.classList.contains("is-selected"));
-    rows.forEach((r) => r.classList.toggle("is-selected", !all));
+  $("btnFullscreen").addEventListener("click", function () {
+    var s = $("viewerStage");
+    if (s.requestFullscreen) s.requestFullscreen();
+    else if (s.webkitRequestFullscreen) s.webkitRequestFullscreen();
   });
-  $("btnDownloadSelected").addEventListener("click", () => {
-    const names = selectedClasses();
-    if (!names.length) return toast("Önce sınıf seçin");
-    downloadText(baseName + "-classes.css", buildSelectedCss(names), "text/css;charset=utf-8");
-    toast(names.length + " sınıf indirildi");
-  });
-
-  // Viewer controls
-  $("btnOpenTab").addEventListener("click", () => {
-    if (blobUrl) window.open(blobUrl, "_blank");
-  });
-  $("btnFullscreen").addEventListener("click", () => {
-    if (viewerStage.requestFullscreen) viewerStage.requestFullscreen();
-    else if (viewerStage.webkitRequestFullscreen) viewerStage.webkitRequestFullscreen();
-  });
-
   $("btnReset").addEventListener("click", resetAll);
 })();
